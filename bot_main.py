@@ -6,7 +6,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
 from google.genai import types
-from supabase import create_client, Client
+import requests
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -20,9 +20,11 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 # 設定日誌
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# 初始化 Gemini 與 Supabase 客戶端
+# 初始化 Gemini 客戶端
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
-supabase = None
+
+# Supabase 專用的 HTTP Headers（直接使用 REST API，繞過 SDK 驗證限制）
+SUPABASE_HEADERS = {}
 
 def get_system_instruction():
     """動態生成包含當前正確時間的系統指令，徹底解決 AI 的時空錯亂問題"""
@@ -43,16 +45,15 @@ def get_system_instruction():
 """
 
 def read_supabase_history() -> str:
-    """從 Supabase 雲端讀取歷史紀錄，組合成文字 Context 給 AI 參考"""
+    """從 Supabase 雲端（透過 REST API）讀取歷史紀錄，組合成文字 Context 給 AI 參考"""
     try:
-        # 撈取最近的 50 筆紀錄（可依需求調整數量）
-        response = supabase.table("brain_box") \
-            .select("*") \
-            .order("created_at", desc=True) \
-            .limit(50) \
-            .execute()
+        url = f"{SUPABASE_URL}/rest/v1/brain_box?select=*&order=created_at.desc&limit=50"
+        response = requests.get(url, headers=SUPABASE_HEADERS)
         
-        records = response.data
+        if response.status_code != 200:
+            return f"[無法從雲端讀取歷史紀錄: HTTP {response.status_code} - {response.text}]"
+            
+        records = response.json()
         if not records:
             return "[目前沒有任何歷史紀錄]"
         
@@ -70,7 +71,7 @@ def read_supabase_history() -> str:
         return f"[無法從雲端讀取歷史紀錄: {str(e)}]"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 雲端大腦快取黑盒子：Supabase 24/7 架構已全面上線！")
+    await update.message.reply_text("🤖 雲端大腦快取黑盒子：Supabase REST API 架構已全面上線！")
 
 async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = ""
@@ -148,14 +149,18 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ai_reply = f"❌ AI 腦袋卡住：({str(e)})"
             is_asking_history = True
 
-    # 3. 唯有在判定為寫入模式時，才將對話寫入 Supabase 雲端資料庫
+    # 3. 唯有在判定為寫入模式時，才將對話透過 REST API 寫入 Supabase 雲端資料庫
     if not is_asking_history and user_message:
         try:
-            supabase.table("brain_box").insert({
+            url = f"{SUPABASE_URL}/rest/v1/brain_box"
+            payload = {
                 "user_message": user_message,
                 "ai_reply": ai_reply,
                 "entry_type": "telegram_chat"
-            }).execute()
+            }
+            res = requests.post(url, headers=SUPABASE_HEADERS, json=payload)
+            if res.status_code not in [200, 201]:
+                logging.error(f"寫入 Supabase 失敗: {res.text}")
         except Exception as e:
             logging.error(f"寫入 Supabase 失敗: {e}")
 
@@ -175,13 +180,18 @@ def run_dummy_server():
     server.serve_forever()
 
 def main():
-    global supabase
+    global SUPABASE_HEADERS
     if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY or not SUPABASE_URL or not SUPABASE_KEY:
         logging.error("環境變數缺失（包含 Supabase 網址或金鑰），請檢查 .env 檔案！")
         return
     
-    # 確保環境變數都有了之後才初始化 Supabase
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    # 設定好 REST API 用的 Headers
+    SUPABASE_HEADERS = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
     
     # 在背景啟動假 HTTP 伺服器以滿足 Render Web Service 的 Port 需求
     server_thread = threading.Thread(target=run_dummy_server, daemon=True)
