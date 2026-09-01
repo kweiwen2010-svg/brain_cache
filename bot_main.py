@@ -22,7 +22,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 
 # 初始化 Gemini 與 Supabase 客戶端
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = None
 
 def get_system_instruction():
     """動態生成包含當前正確時間的系統指令，徹底解決 AI 的時空錯亂問題"""
@@ -175,9 +175,13 @@ def run_dummy_server():
     server.serve_forever()
 
 def main():
+    global supabase
     if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY or not SUPABASE_URL or not SUPABASE_KEY:
         logging.error("環境變數缺失（包含 Supabase 網址或金鑰），請檢查 .env 檔案！")
         return
+    
+    # 確保環境變數都有了之後才初始化 Supabase
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     
     # 在背景啟動假 HTTP 伺服器以滿足 Render Web Service 的 Port 需求
     server_thread = threading.Thread(target=run_dummy_server, daemon=True)
