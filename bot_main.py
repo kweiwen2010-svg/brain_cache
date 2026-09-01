@@ -7,6 +7,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # 載入環境變數
 load_dotenv()
@@ -159,10 +161,28 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(ai_reply)
 
+
+# 建立一個極輕量的假伺服器來應付 Render 的 Port 檢測
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
+    server.serve_forever()
+
 def main():
     if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY or not SUPABASE_URL or not SUPABASE_KEY:
         logging.error("環境變數缺失（包含 Supabase 網址或金鑰），請檢查 .env 檔案！")
         return
+    
+    # 在背景啟動假 HTTP 伺服器以滿足 Render Web Service 的 Port 需求
+    server_thread = threading.Thread(target=run_dummy_server, daemon=True)
+    server_thread.start()
+    
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, handle_inbox))
