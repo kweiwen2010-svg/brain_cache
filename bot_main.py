@@ -167,12 +167,24 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(ai_reply)
 
 
-# 建立一個極輕量的假伺服器來應付 Render 的 Port 檢測
+# 建立一個符合標準 HTTP 規範的伺服器，專門回應 UptimeRobot 與 Render 檢測
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        response_text = b"Bot is running!"
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(response_text)))
         self.end_headers()
-        self.wfile.write(b"Bot is running!")
+        self.wfile.write(response_text)
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        # 關閉自動印出 HTTP 存取日誌，避免刷爆你的控制台 log
+        return
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
