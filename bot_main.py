@@ -12,7 +12,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import pytz
 import json
 import re
-import time
+import asyncio
 
 # 載入環境變數
 load_dotenv()
@@ -32,6 +32,9 @@ SUPABASE_HEADERS = {}
 
 # 強制設定台灣時區
 TAIPEI_TZ = pytz.timezone('Asia/Taipei')
+
+# 全域提醒清單
+ACTIVE_REMINDERS = []
 
 def get_system_instruction():
     """動態生成包含當前正確時間的系統指令"""
@@ -72,26 +75,32 @@ def read_supabase_history() -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：獨立執行緒絕對時間提醒架構已上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
+    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：Asyncio 每秒監控提醒架構已上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
 
-def trigger_reminder_via_http(chat_id: str, message: str, wait_seconds: float):
-    """獨立背景執行緒：精準計時後透過 Telegram 官方 HTTP API 直接推播"""
-    if wait_seconds > 0:
-        time.sleep(wait_seconds)
-    
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": f"🔔【大腦快取主動提醒】：{message}"
-    }
-    try:
-        res = requests.post(url, json=payload, timeout=10)
-        if res.status_code == 200:
-            logging.info(f"成功主動推播給 {chat_id}: {message}")
-        else:
-            logging.error(f"主動推播 Telegram API 失敗: {res.text}")
-    except Exception as e:
-        logging.error(f"主動推播發生例外錯誤: {e}")
+async def global_reminder_checker(application: Application):
+    """每秒掃描全域提醒清單的背景任務"""
+    while True:
+        await asyncio.sleep(1)
+        now = datetime.now(TAIPEI_TZ)
+        to_remove = []
+        for r in ACTIVE_REMINDERS:
+            if now >= r["run_date"]:
+                try:
+                    await application.bot.send_message(
+                        chat_id=r["chat_id"],
+                        text=f"🔔【大腦快取主動提醒】：{r['content']}"
+                    )
+                    logging.info(f"成功主動推播給 {r['chat_id']}: {r['content']}")
+                except Exception as e:
+                    logging.error(f"主動推播失敗: {e}")
+                to_remove.append(r)
+        for r in to_remove:
+            ACTIVE_REMINDERS.remove(r)
+
+async def post_init(application: Application):
+    """機器人啟動時自動註冊背景監控任務"""
+    asyncio.create_task(global_reminder_checker(application))
+    logging.info("Asyncio 每秒提醒監控任務已成功掛載！")
 
 async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
@@ -156,7 +165,7 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         ai_reply = f"❌ AI 腦袋卡住：({str(e)})"
 
-    # 3. 如果是絕對時間提醒，開一個專屬 Daemon Thread 進行計時推播
+    # 3. 如果是絕對時間提醒，加入全域提醒清單
     if is_reminder:
         reminder_content = parsed_data.get("reminder_content", user_message)
         target_time_str = parsed_data.get("target_time", "")
@@ -170,14 +179,12 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.error(f"時間轉換錯誤: {ex}")
 
         if run_date and run_date > now_taipei:
-            seconds_to_wait = (run_date - now_taipei).total_seconds()
-            reminder_thread = threading.Thread(
-                target=trigger_reminder_via_http,
-                args=(str(chat_id), reminder_content, seconds_to_wait),
-                daemon=True
-            )
-            reminder_thread.start()
-            logging.info(f"成功啟動獨立計時執行緒，將於 {seconds_to_wait:.1f} 秒後推播: {reminder_content}")
+            ACTIVE_REMINDERS.append({
+                "chat_id": chat_id,
+                "run_date": run_date,
+                "content": reminder_content
+            })
+            logging.info(f"成功註冊提醒到全域清單，預定觸發時間 (台灣時間): {run_date}，內容: {reminder_content}")
 
     # 4. 寫入 Supabase 雲端資料庫
     if not is_asking_history and user_message:
@@ -235,11 +242,12 @@ def main():
     server_thread = threading.Thread(target=run_dummy_server, daemon=True)
     server_thread.start()
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # 使用 post_init 掛載非同步每秒監控任務
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_inbox))
     
-    logging.info("Telegram Bot 獨立執行緒計時架構啟動中...")
+    logging.info("Telegram Bot Asyncio 每秒監控架構啟動中...")
     app.run_polling()
 
 if __name__ == "__main__":
