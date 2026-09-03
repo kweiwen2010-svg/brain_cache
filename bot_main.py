@@ -71,7 +71,7 @@ def read_supabase_history() -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：內建 JobQueue 提醒架構已上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
+    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：秒數倒數 JobQueue 提醒架構已上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
 
 # JobQueue 觸發時執行的回呼函數
 async def alarm_callback(context: ContextTypes.DEFAULT_TYPE):
@@ -147,7 +147,7 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         ai_reply = f"❌ AI 腦袋卡住：({str(e)})"
 
-    # 3. 如果是絕對時間提醒，使用內建 JobQueue 排程
+    # 3. 如果是絕對時間提醒，計算秒數並透過 JobQueue 排程
     if is_reminder:
         reminder_content = parsed_data.get("reminder_content", user_message)
         target_time_str = parsed_data.get("target_time", "")
@@ -161,13 +161,14 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.error(f"時間轉換錯誤: {ex}")
 
         if run_date and run_date > now_taipei:
+            seconds_to_wait = (run_date - now_taipei).total_seconds()
             context.job_queue.run_once(
                 alarm_callback,
-                when=run_date,
+                when=seconds_to_wait,
                 chat_id=chat_id,
                 data=reminder_content
             )
-            logging.info(f"成功透過 JobQueue 排程提醒於 (台灣時間): {run_date}，內容: {reminder_content}")
+            logging.info(f"成功透過 JobQueue 排程，將於 {seconds_to_wait:.1f} 秒後推播: {reminder_content}")
 
     # 4. 寫入 Supabase 雲端資料庫
     if not is_asking_history and user_message:
@@ -229,7 +230,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_inbox))
     
-    logging.info("Telegram Bot 內建 JobQueue 啟動中...")
+    logging.info("Telegram Bot 內建 JobQueue (秒數倒數版) 啟動中...")
     app.run_polling()
 
 if __name__ == "__main__":
