@@ -2,16 +2,14 @@ import os
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
 from google.genai import types
 import requests
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
-import asyncio
 import json
 import re
 
@@ -33,7 +31,6 @@ SUPABASE_HEADERS = {}
 
 # 強制設定台灣時區
 TAIPEI_TZ = pytz.timezone('Asia/Taipei')
-scheduler = BackgroundScheduler(timezone=TAIPEI_TZ)
 
 def get_system_instruction():
     """動態生成包含當前正確時間的系統指令"""
@@ -74,20 +71,18 @@ def read_supabase_history() -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：絕對時間提醒架構已上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
+    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：內建 JobQueue 提醒架構已上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
 
-async def send_push_message(bot_token: str, chat_id: str, message: str):
-    """執行實際的主動推播"""
+# JobQueue 觸發時執行的回呼函數
+async def alarm_callback(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.chat_id
+    message = job.data
     try:
-        bot = Bot(token=bot_token)
-        await bot.send_message(chat_id=chat_id, text=f"🔔【大腦快取主動提醒】：{message}")
+        await context.bot.send_message(chat_id=chat_id, text=f"🔔【大腦快取主動提醒】：{message}")
         logging.info(f"成功發送主動提醒給 {chat_id}: {message}")
     except Exception as e:
         logging.error(f"主動推播失敗: {e}")
-
-def run_push_job(bot_token: str, chat_id: str, message: str):
-    """供 APScheduler 呼叫的包裝函數"""
-    asyncio.run(send_push_message(bot_token, chat_id, message))
 
 async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
@@ -102,7 +97,7 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_time_str = now_taipei.strftime("%Y-%m-%d %H:%M:%S")
     current_date_date_str = now_taipei.strftime("%Y-%m-%d")
 
-    # 專攻絕對時間的解析提示詞
+    # 絕對時間解析提示詞
     parsing_prompt = f"""
     現在台灣時間是: {current_time_str} (日期是: {current_date_date_str})
     請分析主人說的一句話：『{user_message}』
@@ -152,7 +147,7 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         ai_reply = f"❌ AI 腦袋卡住：({str(e)})"
 
-    # 3. 如果是絕對時間提醒，加入 APScheduler 排程
+    # 3. 如果是絕對時間提醒，使用內建 JobQueue 排程
     if is_reminder:
         reminder_content = parsed_data.get("reminder_content", user_message)
         target_time_str = parsed_data.get("target_time", "")
@@ -166,13 +161,13 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.error(f"時間轉換錯誤: {ex}")
 
         if run_date and run_date > now_taipei:
-            scheduler.add_job(
-                run_push_job,
-                'date',
-                run_date=run_date,
-                args=[TELEGRAM_BOT_TOKEN, str(chat_id), reminder_content]
+            context.job_queue.run_once(
+                alarm_callback,
+                when=run_date,
+                chat_id=chat_id,
+                data=reminder_content
             )
-            logging.info(f"成功排程絕對時間提醒於 (台灣時間): {run_date}，內容: {reminder_content}")
+            logging.info(f"成功透過 JobQueue 排程提醒於 (台灣時間): {run_date}，內容: {reminder_content}")
 
     # 4. 寫入 Supabase 雲端資料庫
     if not is_asking_history and user_message:
@@ -215,7 +210,7 @@ def run_dummy_server():
     server.serve_forever()
 
 def main():
-    global SUPABASE_HEADERS, scheduler
+    global SUPABASE_HEADERS
     if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY or not SUPABASE_URL or not SUPABASE_KEY:
         logging.error("環境變數缺失，請檢查設定！")
         return
@@ -229,19 +224,13 @@ def main():
     
     server_thread = threading.Thread(target=run_dummy_server, daemon=True)
     server_thread.start()
-    
-    scheduler.start()
-    logging.info("APScheduler 絕對時間排程核心已啟動！")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_inbox))
     
-    try:
-        app.run_polling()
-    finally:
-        if scheduler.running:
-            scheduler.shutdown()
+    logging.info("Telegram Bot 內建 JobQueue 啟動中...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
