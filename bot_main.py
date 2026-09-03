@@ -12,6 +12,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import pytz
 import json
 import re
+import time
 
 # 載入環境變數
 load_dotenv()
@@ -71,18 +72,26 @@ def read_supabase_history() -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：秒數倒數 JobQueue 提醒架構已上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
+    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：獨立執行緒絕對時間提醒架構已上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
 
-# JobQueue 觸發時執行的回呼函數
-async def alarm_callback(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    chat_id = job.chat_id
-    message = job.data
+def trigger_reminder_via_http(chat_id: str, message: str, wait_seconds: float):
+    """獨立背景執行緒：精準計時後透過 Telegram 官方 HTTP API 直接推播"""
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": f"🔔【大腦快取主動提醒】：{message}"
+    }
     try:
-        await context.bot.send_message(chat_id=chat_id, text=f"🔔【大腦快取主動提醒】：{message}")
-        logging.info(f"成功發送主動提醒給 {chat_id}: {message}")
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code == 200:
+            logging.info(f"成功主動推播給 {chat_id}: {message}")
+        else:
+            logging.error(f"主動推播 Telegram API 失敗: {res.text}")
     except Exception as e:
-        logging.error(f"主動推播失敗: {e}")
+        logging.error(f"主動推播發生例外錯誤: {e}")
 
 async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
@@ -147,7 +156,7 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         ai_reply = f"❌ AI 腦袋卡住：({str(e)})"
 
-    # 3. 如果是絕對時間提醒，計算秒數並透過 JobQueue 排程
+    # 3. 如果是絕對時間提醒，開一個專屬 Daemon Thread 進行計時推播
     if is_reminder:
         reminder_content = parsed_data.get("reminder_content", user_message)
         target_time_str = parsed_data.get("target_time", "")
@@ -162,13 +171,13 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if run_date and run_date > now_taipei:
             seconds_to_wait = (run_date - now_taipei).total_seconds()
-            context.job_queue.run_once(
-                alarm_callback,
-                when=seconds_to_wait,
-                chat_id=chat_id,
-                data=reminder_content
+            reminder_thread = threading.Thread(
+                target=trigger_reminder_via_http,
+                args=(str(chat_id), reminder_content, seconds_to_wait),
+                daemon=True
             )
-            logging.info(f"成功透過 JobQueue 排程，將於 {seconds_to_wait:.1f} 秒後推播: {reminder_content}")
+            reminder_thread.start()
+            logging.info(f"成功啟動獨立計時執行緒，將於 {seconds_to_wait:.1f} 秒後推播: {reminder_content}")
 
     # 4. 寫入 Supabase 雲端資料庫
     if not is_asking_history and user_message:
@@ -230,7 +239,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_inbox))
     
-    logging.info("Telegram Bot 內建 JobQueue (秒數倒數版) 啟動中...")
+    logging.info("Telegram Bot 獨立執行緒計時架構啟動中...")
     app.run_polling()
 
 if __name__ == "__main__":
