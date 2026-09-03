@@ -1,6 +1,6 @@
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -11,6 +11,8 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from apscheduler.schedulers.background import BackgroundScheduler
 import asyncio
+import json
+import re
 
 # 載入環境變數
 load_dotenv()
@@ -18,8 +20,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-# 如果你有固定的 Telegram Chat ID 可填入環境變數，或從資料庫動態讀取
-TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
 
 # 設定日誌
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -27,43 +27,39 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 # 初始化 Gemini 客戶端
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Supabase 專用的 HTTP Headers（直接使用 REST API，繞過 SDK 驗證限制）
+# Supabase 專用的 HTTP Headers
 SUPABASE_HEADERS = {}
 
+# 全域宣告 APScheduler 排程器
+scheduler = BackgroundScheduler()
+
 def get_system_instruction():
-    """動態生成包含當前正確時間的系統指令，徹底解決 AI 的時空錯亂問題"""
+    """動態生成包含當前正確時間的系統指令"""
     current_date_str = datetime.now().strftime("%Y年%m月%d日")
     return f"""
 你是一個專為主人 Vincent 服務的智慧大腦快取秘書。
 【重要時間校正】：今天是 {current_date_str}。請記住現在就是 2026 年，絕對不要把 2026 年的任何歷史紀錄誤認為是『未來』！
 
-你的核心任務有兩個：
-1. 【日常碎碎念提煉（寫入模式）】：當主人向你傾倒生活瑣碎、情緒或待辦時，幫他進行『大腦排毒與提煉』。
-   格式必須包含：
-   - 一句幽默、輕鬆調侃但絕對忠誠的垃圾話吐槽或安慰。
-   - 【✨ 核心提煉】：將重點用極簡條列式整理（不超過3條）。
-
-2. 【歷史黑盒子查詢（查詢模式）】：當主人的提問是在翻舊帳、詢問過去某天做了什麼、或是找之前提過的事物時（例如問：某天做了啥、哪一天清理神明廳、翻一下以前的紀錄等）。
-   - 你必須仔細閱讀系統附帶給你的『歷史黑盒子紀錄』。
-   - 幫主人精確找出他想要的答案與當時的『紀錄時間』。如果檔案裡真的有，不准裝傻說不知道或說那是未來！
+你的核心任務：
+1. 【日常碎碎念與提醒設定】：當主人向你傾倒生活瑣碎、待辦、或是要求『提醒』時：
+   - 給予一句幽默、輕鬆調侃但絕對忠誠的垃圾話吐槽或安慰。
+   - 【✨ 核心提煉】：將重點用極簡條列式整理。
 """
 
 def read_supabase_history() -> str:
-    """從 Supabase 雲端（透過 REST API）讀取歷史紀錄，組合成文字 Context 給 AI 參考"""
+    """從 Supabase 雲端讀取歷史紀錄"""
     try:
         url = f"{SUPABASE_URL}/rest/v1/brain_box?select=*&order=created_at.desc&limit=50"
         response = requests.get(url, headers=SUPABASE_HEADERS)
         
         if response.status_code != 200:
-            return f"[無法從雲端讀取歷史紀錄: HTTP {response.status_code} - {response.text}]"
+            return f"[無法從雲端讀取歷史紀錄: HTTP {response.status_code}]"
             
         records = response.json()
         if not records:
             return "[目前沒有任何歷史紀錄]"
         
-        # 讓時間由舊到新排序，方便 AI 閱讀脈絡
         records.reverse()
-        
         history_str = ""
         for row in records:
             history_str += f"--- 紀錄時間: {row.get('created_at')} ---\n"
@@ -72,108 +68,109 @@ def read_supabase_history() -> str:
             
         return history_str
     except Exception as e:
-        return f"[無法從雲端讀取歷史紀錄: {str(e)]"
+        return f"[無法從雲端讀取歷史紀錄: {str(e)}]"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：Supabase REST API 架構已全面上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
+    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：智慧動態提醒架構已全面上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
 
-async def send_active_reminder(bot_token: str, chat_id: str):
-    """主動推播防忘提醒到指定的 Telegram chat_id"""
-    if not chat_id:
-        logging.warning("未設定 TARGET_CHAT_ID，無法發送主動提醒。")
-        return
+async def send_push_message(bot_token: str, chat_id: str, message: str):
+    """執行實際的主動推播"""
     try:
         bot = Bot(token=bot_token)
-        await bot.send_message(
-            chat_id=chat_id, 
-            text="🔔【大腦快取主動提醒】：主人，記得檢查今天的待辦事項與進度喔！有什麼想記的隨時丟給我。"
-        )
-        logging.info("成功發送主動防忘提醒！")
+        await bot.send_message(chat_id=chat_id, text=f"🔔【大腦快取主動提醒】：{message}")
+        logging.info(f"成功發送主動提醒給 {chat_id}: {message}")
     except Exception as e:
         logging.error(f"主動推播失敗: {e}")
 
-def run_reminder_job(bot_token: str, chat_id: str):
-    """包裝非同步排程任務供 APScheduler 呼叫"""
-    asyncio.run(send_active_reminder(bot_token, chat_id))
+def run_push_job(bot_token: str, chat_id: str, message: str):
+    """供 APScheduler 呼叫的包裝函數"""
+    asyncio.run(send_push_message(bot_token, chat_id, message))
 
 async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_message = ""
-    await update.message.reply_chat_action(action="typing")
-    
-    # 從雲端 Supabase 讀取完整的歷史紀錄庫
-    history_context = read_supabase_history()
-    
-    # 1. 語音訊息處理
-    if update.message.voice:
-        voice_file = await context.bot.get_file(update.message.voice.file_id)
-        temp_voice_path = "temp_voice.ogg"
-        await voice_file.download_to_drive(temp_voice_path)
-        
-        try:
-            with open(temp_voice_path, 'rb') as f:
-                audio_bytes = f.read()
-            
-            full_prompt = f"請聽這段語音。如果內容是查詢過去的事，請從下方的歷史紀錄庫找出答案；如果是日常交代，請進行提煉。\n\n【歷史黑盒子紀錄如下】:\n{history_context}"
-            
-            response = ai_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=[types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"), full_prompt],
-                config=types.GenerateContentConfig(system_instruction=get_system_instruction(), temperature=0.2)
-            )
-            ai_reply = response.text
-            
-            is_asking_history = False 
-            user_message = "[語音訊息紀錄]"
-            
-        except Exception as e:
-            ai_reply = f"❌ 語音解析出錯：({str(e)})"
-            is_asking_history = True
-        finally:
-            if os.path.exists(temp_voice_path):
-                os.remove(temp_voice_path)
-                
-    # 2. 文字訊息處理
-    else:
-        user_message = update.message.text
-        
-        # 雙層 AI 決策機制
-        intent_prompt = f"""
-        請幫我判定下面這句主人說的話，他的真正意圖是什麼？
-        主人說：『{user_message}』
-        
-        如果他是想【查詢過去的歷史、問某天做了什麼、找以前記過的事情、問哪一天完成了某事】，請精確回覆：QUERY
-        如果他只是在【碎碎念、倒垃圾、交代日常、記錄現在剛發生的事、新增待辦事項】，請精確回覆：WRITE
-        
-        注意：只能回覆 QUERY 或 WRITE，不要有任何其他字眼。
-        """
-        try:
-            intent_res = ai_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=intent_prompt
-            )
-            intent = intent_res.text.strip().upper()
-            is_asking_history = ("QUERY" in intent)
-        except Exception:
-            is_asking_history = False 
-            
-        try:
-            if is_asking_history:
-                input_content = f"主人正在查詢歷史，提問如下：\n『{user_message}』\n\n【以下是為您調出的歷史黑盒子檔案（包含精確時間戳記）】:\n{history_context}\n\n請根據檔案內容，精確回答主人的問題。"
-            else:
-                input_content = f"主人正在記錄新日常：\n『{user_message}』\n\n請依據系統指令進行排毒與提煉。"
-                
-            response = ai_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=input_content,
-                config=types.GenerateContentConfig(system_instruction=get_system_instruction(), temperature=0.3)
-            )
-            ai_reply = response.text
-        except Exception as e:
-            ai_reply = f"❌ AI 腦袋卡住：({str(e)})"
-            is_asking_history = True
+    user_message = update.message.text
+    chat_id = update.effective_chat.id
+    if not user_message:
+        return
 
-    # 3. 唯有在判定為寫入模式時，才將對話透過 REST API 寫入 Supabase 雲端資料庫
+    await update.message.reply_chat_action(action="typing")
+    history_context = read_supabase_history()
+    current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. 智慧意圖與提醒解析 (Intent & Reminder Parser)
+    parsing_prompt = f"""
+    現在時間是: {current_time_str}
+    請分析主人說的一句話：『{user_message}』
+    
+    請判斷這是否包含「設定提醒、多久後提醒、幾點幾分提醒」的需求。
+    請嚴格回傳一個 JSON 格式（不要有 markdown 程式碼區塊語法，直接回傳純 JSON 字串）：
+    {{
+      "is_reminder": true 或 false,
+      "delay_minutes": 數字 (如果是相對時間，例如 3分鐘後就填 3，半小時填 30。若不是相對時間則填 0),
+      "target_time": "YYYY-MM-DD HH:MM:SS" (如果是絕對時間，請依據當前時間推算出正確的目標時間字串；若不是絕對時間填 ""),
+      "reminder_content": "要提醒的具體事情內容",
+      "intent": "QUERY" 或 "WRITE" 或 "REMINDER"
+    }}
+    """
+    
+    try:
+        parse_res = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=parsing_prompt
+        )
+        clean_text = re.sub(r```(?:json)?\s*([\s\S]*?)\s*```, r"\1", parse_res.text.strip())
+        parsed_data = json.loads(clean_text)
+    except Exception as e:
+        logging.error(f"解析意圖失敗: {e}")
+        parsed_data = {"is_reminder": False, "intent": "WRITE"}
+
+    is_asking_history = (parsed_data.get("intent") == "QUERY")
+    is_reminder = parsed_data.get("is_reminder", False)
+
+    # 2. 處理回覆內容生成
+    try:
+        if is_asking_history:
+            input_content = f"主人正在查詢歷史，提問如下：\n『{user_message}』\n\n【以下是為您調出的歷史黑盒子檔案】:\n{history_context}\n\n請根據檔案內容，精確回答主人的問題。"
+        elif is_reminder:
+            content_desc = parsed_data.get("reminder_content", user_message)
+            input_content = f"主人設定了一個動態提醒：『{user_message}』。\n請依據系統指令給予幽默吐槽，並在核心提煉中條列：1. 設定動態提醒。 2. 提醒內容：{content_desc}。"
+        else:
+            input_content = f"主人正在記錄新日常：\n『{user_message}』\n\n請依據系統指令進行排毒與提煉。"
+            
+        response = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=input_content,
+            config=types.GenerateContentConfig(system_instruction=get_system_instruction(), temperature=0.3)
+        )
+        ai_reply = response.text
+    except Exception as e:
+        ai_reply = f"❌ AI 腦袋卡住：({str(e)})"
+
+    # 3. 如果是提醒，動態加入 APScheduler 排程
+    if is_reminder:
+        reminder_content = parsed_data.get("reminder_content", user_message)
+        delay_min = parsed_data.get("delay_minutes", 0)
+        target_time_str = parsed_data.get("target_time", "")
+
+        run_date = None
+        if delay_min and delay_min > 0:
+            run_date = datetime.now() + timedelta(minutes=float(delay_min))
+        elif target_time_str:
+            try:
+                run_date = datetime.strptime(target_time_str, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+
+        if run_date and run_date > datetime.now():
+            scheduler.add_job(
+                run_push_job,
+                'date',
+                run_date=run_date,
+                args=[TELEGRAM_BOT_TOKEN, str(chat_id), reminder_content]
+            )
+            logging.info(f"成功動態排程提醒於: {run_date}，內容: {reminder_content}")
+
+    # 4. 寫入 Supabase 雲端資料庫
     if not is_asking_history and user_message:
         try:
             url = f"{SUPABASE_URL}/rest/v1/brain_box"
@@ -190,8 +187,7 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(ai_reply)
 
-
-# 建立一個符合標準 HTTP 規範的伺服器，專門回應 UptimeRobot 與 Render 檢測
+# 保持 Render 服務在線的 HTTP 伺服器
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         response_text = b"Bot is running!"
@@ -215,12 +211,11 @@ def run_dummy_server():
     server.serve_forever()
 
 def main():
-    global SUPABASE_HEADERS
+    global SUPABASE_HEADERS, scheduler
     if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY or not SUPABASE_URL or not SUPABASE_KEY:
-        logging.error("環境變數缺失（包含 Supabase 網址或金鑰），請檢查 .env 檔案！")
+        logging.error("環境變數缺失，請檢查設定！")
         return
     
-    # 設定好 REST API 用的 Headers
     SUPABASE_HEADERS = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -228,29 +223,17 @@ def main():
         "Prefer": "return=minimal"
     }
     
-    # 在背景啟動假 HTTP 伺服器以滿足 Render Web Service 的 Port 需求
+    # 啟動背景 HTTP 伺服器
     server_thread = threading.Thread(target=run_dummy_server, daemon=True)
     server_thread.start()
     
-    # 啟動 APScheduler 定時排程背景服務
-    scheduler = BackgroundScheduler()
-    if TARGET_CHAT_ID:
-        # 範例：設定每天早上 9:00 主動推播防忘提醒
-        scheduler.add_job(
-            run_reminder_job, 
-            'cron', 
-            hour=9, 
-            minute=0, 
-            args=[TELEGRAM_BOT_TOKEN, TARGET_CHAT_ID]
-        )
-        scheduler.start()
-        logging.info("APScheduler 定時排程已成功啟動！")
-    else:
-        logging.info("尚未設定 TARGET_CHAT_ID 環境變數，定時主動推播功能暫未激活。")
+    # 啟動 APScheduler
+    scheduler.start()
+    logging.info("APScheduler 智慧動態排程核心已啟動！")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, handle_inbox))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_inbox))
     
     try:
         app.run_polling()
