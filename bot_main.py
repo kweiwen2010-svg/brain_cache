@@ -2,13 +2,15 @@ import os
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
 from google.genai import types
 import requests
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from apscheduler.schedulers.background import BackgroundScheduler
+import asyncio
 
 # 載入環境變數
 load_dotenv()
@@ -16,6 +18,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# 如果你有固定的 Telegram Chat ID 可填入環境變數，或從資料庫動態讀取
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
 
 # 設定日誌
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -68,10 +72,30 @@ def read_supabase_history() -> str:
             
         return history_str
     except Exception as e:
-        return f"[無法從雲端讀取歷史紀錄: {str(e)}]"
+        return f"[無法從雲端讀取歷史紀錄: {str(e)]"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 雲端大腦快取黑盒子：Supabase REST API 架構已全面上線！")
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：Supabase REST API 架構已全面上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
+
+async def send_active_reminder(bot_token: str, chat_id: str):
+    """主動推播防忘提醒到指定的 Telegram chat_id"""
+    if not chat_id:
+        logging.warning("未設定 TARGET_CHAT_ID，無法發送主動提醒。")
+        return
+    try:
+        bot = Bot(token=bot_token)
+        await bot.send_message(
+            chat_id=chat_id, 
+            text="🔔【大腦快取主動提醒】：主人，記得檢查今天的待辦事項與進度喔！有什麼想記的隨時丟給我。"
+        )
+        logging.info("成功發送主動防忘提醒！")
+    except Exception as e:
+        logging.error(f"主動推播失敗: {e}")
+
+def run_reminder_job(bot_token: str, chat_id: str):
+    """包裝非同步排程任務供 APScheduler 呼叫"""
+    asyncio.run(send_active_reminder(bot_token, chat_id))
 
 async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = ""
@@ -183,7 +207,6 @@ class SimpleHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format, *args):
-        # 關閉自動印出 HTTP 存取日誌，避免刷爆你的控制台 log
         return
 
 def run_dummy_server():
@@ -209,10 +232,31 @@ def main():
     server_thread = threading.Thread(target=run_dummy_server, daemon=True)
     server_thread.start()
     
+    # 啟動 APScheduler 定時排程背景服務
+    scheduler = BackgroundScheduler()
+    if TARGET_CHAT_ID:
+        # 範例：設定每天早上 9:00 主動推播防忘提醒
+        scheduler.add_job(
+            run_reminder_job, 
+            'cron', 
+            hour=9, 
+            minute=0, 
+            args=[TELEGRAM_BOT_TOKEN, TARGET_CHAT_ID]
+        )
+        scheduler.start()
+        logging.info("APScheduler 定時排程已成功啟動！")
+    else:
+        logging.info("尚未設定 TARGET_CHAT_ID 環境變數，定時主動推播功能暫未激活。")
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, handle_inbox))
-    app.run_polling()
+    
+    try:
+        app.run_polling()
+    finally:
+        if scheduler.running:
+            scheduler.shutdown()
 
 if __name__ == "__main__":
     main()
