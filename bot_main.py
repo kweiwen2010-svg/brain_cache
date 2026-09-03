@@ -1,6 +1,6 @@
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -33,8 +33,6 @@ SUPABASE_HEADERS = {}
 
 # 強制設定台灣時區
 TAIPEI_TZ = pytz.timezone('Asia/Taipei')
-
-# 建立 APScheduler 並綁定台灣時區
 scheduler = BackgroundScheduler(timezone=TAIPEI_TZ)
 
 def get_system_instruction():
@@ -76,7 +74,7 @@ def read_supabase_history() -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：台灣時區動態提醒架構已全面上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
+    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：絕對時間提醒架構已上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
 
 async def send_push_message(bot_token: str, chat_id: str, message: str):
     """執行實際的主動推播"""
@@ -100,21 +98,20 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_chat_action(action="typing")
     history_context = read_supabase_history()
     
-    # 取得精確的台灣現下時間
     now_taipei = datetime.now(TAIPEI_TZ)
     current_time_str = now_taipei.strftime("%Y-%m-%d %H:%M:%S")
+    current_date_date_str = now_taipei.strftime("%Y-%m-%d")
 
-    # 1. 智慧意圖與提醒解析
+    # 專攻絕對時間的解析提示詞
     parsing_prompt = f"""
-    現在台灣時間是: {current_time_str}
+    現在台灣時間是: {current_time_str} (日期是: {current_date_date_str})
     請分析主人說的一句話：『{user_message}』
     
-    請判斷這是否包含「設定提醒、多久後提醒、幾點幾分提醒」的需求。
+    請判斷這是否包含「指定某個絕對時間點提醒」的需求（例如：「15:30 提醒我開會」、「晚上8點叫我吃藥」）。
     請嚴格回傳一個合法的 JSON 格式（不要加上任何 markdown 標籤如 ```json，直接回傳純文字 JSON）：
     {{
       "is_reminder": true 或 false,
-      "delay_minutes": 數字 (如果是相對時間，例如 2分鐘後填 2，3分鐘後填 3。若不是相對時間則填 0),
-      "target_time": "YYYY-MM-DD HH:MM:SS" (如果是絕對時間，請依據當前時間推算出正確的目標時間字串；若不是絕對時間填 ""),
+      "target_time": "YYYY-MM-DD HH:MM:SS" (請務必將主人口述的時間轉換為絕對時間點。例如今天 15:30 就填 "{current_date_date_str} 15:30:00"。若不是絕對時間填 ""),
       "reminder_content": "要提醒的具體事情內容",
       "intent": "QUERY" 或 "WRITE" 或 "REMINDER"
     }}
@@ -125,12 +122,11 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
             model='gemini-2.5-flash',
             contents=parsing_prompt
         )
-        # 清理可能帶有的 markdown 標籤
         raw_res = parse_res.text.strip()
         clean_text = re.sub(r'^```(?:json)?\s*([\s\S]*?)\s*```$', r'\1', raw_res)
         parsed_data = json.loads(clean_text)
     except Exception as e:
-        logging.error(f"解析意圖失敗: {e} | 原始回應: {parse_res.text if 'parse_res' in locals() else 'N/A'}")
+        logging.error(f"解析意圖失敗: {e}")
         parsed_data = {"is_reminder": False, "intent": "WRITE"}
 
     is_asking_history = (parsed_data.get("intent") == "QUERY")
@@ -142,7 +138,8 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
             input_content = f"主人正在查詢歷史，提問如下：\n『{user_message}』\n\n【以下是為您調出的歷史黑盒子檔案】:\n{history_context}\n\n請根據檔案內容，精確回答主人的問題。"
         elif is_reminder:
             content_desc = parsed_data.get("reminder_content", user_message)
-            input_content = f"主人設定了一個動態提醒：『{user_message}』。\n請依據系統指令給予幽默吐槽，並在核心提煉中條列：1. 設定動態提醒。 2. 提醒內容：{content_desc}。"
+            target_t = parsed_data.get("target_time", "")
+            input_content = f"主人設定了一個絕對時間提醒：『{user_message}』（預定時間：{target_t}）。\n請依據系統指令給予幽默吐槽，並在核心提煉中條列：1. 設定絕對時間提醒。 2. 預定時間：{target_t}。 3. 提醒內容：{content_desc}。"
         else:
             input_content = f"主人正在記錄新日常：\n『{user_message}』\n\n請依據系統指令進行排毒與提煉。"
             
@@ -155,21 +152,18 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         ai_reply = f"❌ AI 腦袋卡住：({str(e)})"
 
-    # 3. 如果是提醒，動態加入 APScheduler 排程（加入時區對齊）
+    # 3. 如果是絕對時間提醒，加入 APScheduler 排程
     if is_reminder:
         reminder_content = parsed_data.get("reminder_content", user_message)
-        delay_min = parsed_data.get("delay_minutes", 0)
         target_time_str = parsed_data.get("target_time", "")
 
         run_date = None
-        if delay_min and float(delay_min) > 0:
-            run_date = now_taipei + timedelta(minutes=float(delay_min))
-        elif target_time_str:
+        if target_time_str:
             try:
                 naive_dt = datetime.strptime(target_time_str, "%Y-%m-%d %H:%M:%S")
                 run_date = TAIPEI_TZ.localize(naive_dt)
-            except Exception:
-                pass
+            except Exception as ex:
+                logging.error(f"時間轉換錯誤: {ex}")
 
         if run_date and run_date > now_taipei:
             scheduler.add_job(
@@ -178,7 +172,7 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 run_date=run_date,
                 args=[TELEGRAM_BOT_TOKEN, str(chat_id), reminder_content]
             )
-            logging.info(f"成功動態排程提醒於 (台灣時間): {run_date}，內容: {reminder_content}")
+            logging.info(f"成功排程絕對時間提醒於 (台灣時間): {run_date}，內容: {reminder_content}")
 
     # 4. 寫入 Supabase 雲端資料庫
     if not is_asking_history and user_message:
@@ -233,13 +227,11 @@ def main():
         "Prefer": "return=minimal"
     }
     
-    # 啟動背景 HTTP 伺服器
     server_thread = threading.Thread(target=run_dummy_server, daemon=True)
     server_thread.start()
     
-    # 啟動 APScheduler
     scheduler.start()
-    logging.info("APScheduler 台灣時區智慧動態排程核心已啟動！")
+    logging.info("APScheduler 絕對時間排程核心已啟動！")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
