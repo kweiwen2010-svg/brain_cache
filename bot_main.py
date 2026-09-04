@@ -83,7 +83,7 @@ def fetch_web_page_content(url: str) -> str:
         
         html_text = response.text
         clean_text = re.sub(r'<script.*?>.*?</script>', '', html_text, flags=re.DOTALL)
-        clean_text = re.sub(r'<style.*?>.*?</style>', '', clean_text, flags=re.DOTALL)
+        clean_text = re.sub(r'<style.*?>.*?</style>', '', html_text, flags=re.DOTALL)
         clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
         clean_text = re.sub(r'\s+', ' ', clean_text).strip()
         
@@ -161,7 +161,6 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 contents=parsing_prompt
             )
             raw_res = parse_res.text.strip()
-            # 安全清理 JSON 格式
             clean_text = raw_res
             if "{" in clean_text and "}" in clean_text:
                 start_idx = clean_text.find("{")
@@ -273,16 +272,19 @@ def check_and_send_reminders() -> int:
             content = rem.get("content")
             
             tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            # 加上 disable_notification=False 確保一定有音效與彈出通知
             payload = {
                 "chat_id": chat_id,
-                "text": f"🔔【大腦快取主動提醒】：{content}"
+                "text": f"🚨 **【大腦快取緊急呼叫】** 🚨\n\n{content}",
+                "parse_mode": "Markdown",
+                "disable_notification": False
             }
             tg_res = requests.post(tg_url, json=payload, timeout=10)
             if tg_res.status_code == 200:
                 update_url = f"{SUPABASE_URL}/rest/v1/reminders?id=eq.{rem_id}"
                 requests.patch(update_url, headers=SUPABASE_HEADERS, json={"is_sent": True})
                 count += 1
-                logging.info(f"成功透過 /check 觸發推播給 {chat_id}: {content}")
+                logging.info(f"成功透過 /check 觸發強效推播給 {chat_id}: {content}")
             else:
                 logging.error(f"推播失敗: {tg_res.text}")
         return count
