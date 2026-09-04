@@ -4,4 +4,4 @@ supabase
 requests
 python-dotenv
 apscheduler
-pytz
+beautifulsoup4

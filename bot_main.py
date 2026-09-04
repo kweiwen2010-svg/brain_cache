@@ -13,6 +13,7 @@ import urllib.parse
 import json
 import re
 import traceback
+from bs4 import BeautifulSoup
 
 # 載入環境變數
 load_dotenv()
@@ -30,7 +31,7 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 # Supabase 專用的 HTTP Headers
 SUPABASE_HEADERS = {}
 
-# 強制設定台灣時區 (UTC+8，使用內建 datetime 避開 pytz 相依問題)
+# 強制設定台灣時區 (UTC+8)
 TAIPEI_TZ = timezone(timedelta(hours=8))
 
 def get_system_instruction():
@@ -41,7 +42,7 @@ def get_system_instruction():
 【重要時間校正】：今天是 {current_date_str}（台灣時間）。
 
 你的核心任務：
-1. 【日常碎碎念與提醒設定】：當主人向你傾倒生活瑣碎、待辦、或是要求『提醒』時：
+1. 【日常碎碎念與提醒、網址摘要】：當主人向你傾倒生活瑣事、待辦、要求提醒或是丟入文章網址摘要時：
    - 給予一句幽默、輕鬆調侃但絕對忠誠的垃圾話吐槽或安慰。
    - 【✨ 核心提煉】：將重點用極簡條列式整理。
 """
@@ -70,9 +71,31 @@ def read_supabase_history() -> str:
     except Exception as e:
         return f"[無法從雲端讀取歷史紀錄: {str(e)}]"
 
+def fetch_webpage_content(url: str) -> str:
+    """抓取網址的文字內容"""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return f"[無法讀取網頁內容，HTTP 狀態碼: {response.status_code}]"
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # 移除不需要的標籤
+        for script in soup(["script", "style", "nav", "footer", "header"]):
+            script.extract()
+            
+        text = soup.get_text(separator=' ', strip=True)
+        # 限制字數避免過長
+        return text[:8000]
+    except Exception as e:
+        return f"[抓取網頁發生錯誤: {str(e)}]"
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：Supabase 雲端排程架構已上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
+    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：已升級「網址一鍵摘要」功能！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
 
 async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
@@ -87,12 +110,22 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_time_str = now_taipei.strftime("%Y-%m-%d %H:%M:%S")
     current_date_str = now_taipei.strftime("%Y-%m-%d")
 
-    # 1. 鐵律：用正規表達式精準捕捉時間（支援 12:23、9:26 等格式）
+    # 1. 檢查是否包含網址
+    url_match = re.search(r'(https?://[^\s]+)', user_message)
+    scraped_article_text = ""
+    is_url_summary = False
+
+    if url_match:
+        target_url = url_match.group(1)
+        scraped_article_text = fetch_webpage_content(target_url)
+        is_url_summary = True
+
+    # 2. 鐵律：用正規表達式精準捕捉時間提醒
     extracted_target_time = ""
     reminder_content = user_message
     
     time_match = re.search(r'(\d{1,2})\s*[:：]\s*(\d{1,2})', user_message)
-    if time_match:
+    if time_match and not is_url_summary: # 如果是網址摘要就不當作提醒
         hour, minute = time_match.groups()
         extracted_target_time = f"{current_date_str} {int(hour):02d}:{int(minute):02d}:00"
         
@@ -101,12 +134,17 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if cleaned_content:
             reminder_content = cleaned_content
 
-    # 2. 如果成功抓到時間，直接強制判定為提醒
+    # 3. 判斷意圖與組裝 Prompt
     if extracted_target_time:
         is_reminder = True
         target_time_str = extracted_target_time
         is_asking_history = False
         input_content = f"主人設定了一個絕對時間提醒：『{user_message}』（預定時間：{target_time_str}，內容：{reminder_content}）。\n請依據系統指令給予幽默吐槽，並在核心提煉中條列：1. 設定絕對時間提醒。 2. 預定時間：{target_time_str}。 3. 提醒內容：{reminder_content}。"
+    elif is_url_summary:
+        is_reminder = False
+        target_time_str = ""
+        is_asking_history = False
+        input_content = f"主人貼了一個網址要求摘要與分析。主人的原始訊息：『{user_message}』\n\n以下是從該網址抓取到的文章內容：\n{scraped_article_text}\n\n請依據系統指令吐嘈，並提供精準的【✨ 核心提煉】重點摘要。"
     else:
         parsing_prompt = f"""
         現在台灣時間是: {current_time_str} (日期是: {current_date_str})
@@ -131,11 +169,11 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_reminder = False
         target_time_str = ""
 
-    # 3. 處理 AI 回覆內容生成
+    # 4. 處理 AI 回覆內容生成
     try:
         if is_asking_history:
             input_content = f"主人正在查詢歷史，提問如下：\n『{user_message}』\n\n【以下是為您調出的歷史黑盒子檔案】:\n{history_context}\n\n請根據檔案內容，精確回答主人的問題。"
-        elif not is_reminder:
+        elif not is_reminder and not is_url_summary:
             input_content = f"主人正在記錄新日常：\n『{user_message}』\n\n請依據系統指令進行排毒與提煉。"
             
         response = ai_client.models.generate_content(
@@ -147,7 +185,7 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         ai_reply = f"❌ AI 腦袋卡住：({str(e)})"
 
-    # 4. 如果是提醒，寫入 Supabase 的 reminders 資料表
+    # 5. 如果是提醒，寫入 Supabase 的 reminders 資料表
     if is_reminder and target_time_str:
         try:
             url = f"{SUPABASE_URL}/rest/v1/reminders"
@@ -165,7 +203,7 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"存入 Supabase 提醒例外: {e}")
 
-    # 5. 寫入 Supabase 歷史聊天資料庫
+    # 6. 寫入 Supabase 歷史聊天資料庫
     if not is_asking_history and user_message:
         try:
             url = f"{SUPABASE_URL}/rest/v1/brain_box"
