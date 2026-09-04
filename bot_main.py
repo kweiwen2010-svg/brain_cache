@@ -1,6 +1,6 @@
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -10,7 +10,6 @@ import requests
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
-import pytz
 import json
 import re
 import traceback
@@ -31,8 +30,8 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 # Supabase 專用的 HTTP Headers
 SUPABASE_HEADERS = {}
 
-# 強制設定台灣時區
-TAIPEI_TZ = pytz.timezone('Asia/Taipei')
+# 強制設定台灣時區 (UTC+8，使用內建 datetime 避開 pytz 相依問題)
+TAIPEI_TZ = timezone(timedelta(hours=8))
 
 def get_system_instruction():
     """動態生成包含當前正確時間的系統指令"""
