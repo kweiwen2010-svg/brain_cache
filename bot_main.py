@@ -85,27 +85,36 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     now_taipei = datetime.now(TAIPEI_TZ)
     current_time_str = now_taipei.strftime("%Y-%m-%d %H:%M:%S")
-    current_date_date_str = now_taipei.strftime("%Y-%m-%d")
+    current_date_str = now_taipei.strftime("%Y-%m-%d")
 
-    # 絕對時間解析提示詞
-    parsing_prompt = f"""
-    現在台灣時間是: {current_time_str} (日期是: {current_date_date_str})
-    請分析主人說的一句話：『{user_message}』
-    
-    請判斷這是否包含「指定某個絕對時間點提醒」的需求（例如：「15:30 提醒我開會」、「晚上8點叫我吃藥」）。
-    請嚴格回傳一個合法的 JSON 格式（不要加上任何 markdown 標籤如 ```json，直接回傳純文字 JSON）：
-    {{
-      "is_reminder": true 或 false,
-      "target_time": "YYYY-MM-DD HH:MM:SS" (請務必將主人口述的時間轉換為絕對時間點。例如今天 15:30 就填 "{current_date_date_str} 15:30:00"。若不是絕對時間填 ""),
-      "reminder_content": "要提醒的具體事情內容",
-      "intent": "QUERY" 或 "WRITE" 或 "REMINDER"
-    }}
-    """
-    
-    try:
-        parse_res = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=parsing_prompt
-        )
-        raw_res = parse_res.text.strip()
-        clean_text = re.sub(r'^
+    # 1. 鐵律：直接用 Python 正規表達式抓取時間（例如 9: 26、09:26）
+    extracted_target_time = ""
+    time_match = re.search(r'(\d{1,2})\s*[:：]\s*(\d{1,2})', user_message)
+    if time_match:
+        hour, minute = time_match.groups()
+        extracted_target_time = f"{current_date_str} {int(hour):02d}:{int(minute):02d}:00"
+
+    # 2. 如果 Python 有抓到時間，直接強制為提醒
+    if extracted_target_time:
+        is_reminder = True
+        target_time_str = extracted_target_time
+        reminder_content = user_message
+        is_asking_history = False
+        input_content = f"主人設定了一個絕對時間提醒：『{user_message}』（預定時間：{target_time_str}）。\n請依據系統指令給予幽默吐槽，並在核心提煉中條列：1. 設定絕對時間提醒。 2. 預定時間：{target_time_str}。 3. 提醒內容：{reminder_content}。"
+    else:
+        # 如果沒抓到時間，才交給 AI 判斷是歷史查詢還是普通記錄
+        parsing_prompt = f"""
+        現在台灣時間是: {current_time_str} (日期是: {current_date_str})
+        請分析主人說的一句話：『{user_message}』
+        請嚴格回傳一個合法的 JSON 格式（不要加上任何 markdown 標籤，直接回傳純文字 JSON）：
+        {{
+          "intent": "QUERY" 或 "WRITE"
+        }}
+        """
+        try:
+            parse_res = ai_client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=parsing_prompt
+            )
+            raw_res = parse_res.text.strip()
+            clean_text = re.sub(r'^```(?:json)?\s*([\s\S]*?)\s*
