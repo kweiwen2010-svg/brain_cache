@@ -41,7 +41,7 @@ def get_system_instruction():
 【重要時間校正】：今天是 {current_date_str}（台灣時間）。
 
 你的核心任務：
-1. 【日常碎碎念與提醒設定】：當主人向你傾倒生活瑣碎、待辦、或是要求『提醒』時：
+1. 【日常碎碎念與紀錄】：當主人跟你對話、發牢騷、記事時：
    - 給予一句幽默、輕鬆調侃但絕對忠誠的垃圾話吐槽或安慰。
    - 【✨ 核心提煉】：將重點用極簡條列式整理。
 """
@@ -87,57 +87,52 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_time_str = now_taipei.strftime("%Y-%m-%d %H:%M:%S")
     current_date_str = now_taipei.strftime("%Y-%m-%d")
 
-    # 1. 鐵律：用正規表達式精準捕捉時間（支援 12:23、9:26 等格式）
+    # 1. 預先用 Python 抓出訊息中的時間（備用）
     extracted_target_time = ""
-    reminder_content = user_message
-    
     time_match = re.search(r'(\d{1,2})\s*[:：]\s*(\d{1,2})', user_message)
     if time_match:
         hour, minute = time_match.groups()
         extracted_target_time = f"{current_date_str} {int(hour):02d}:{int(minute):02d}:00"
-        
-        # 自動把時間字串從提醒內容中濾掉，讓內容更乾淨（例如把 "12:23發音提醒 我動一動" 轉成 "動一動"）
-        cleaned_content = re.sub(r'\d{1,2}\s*[:：]\s*\d{1,2}', '', user_message)
-        cleaned_content = re.sub(r'發音提醒|提醒我|提醒|我', '', cleaned_content).strip()
-        if cleaned_content:
-            reminder_content = cleaned_content
 
-    # 2. 如果成功抓到時間，直接強制判定為提醒
-    if extracted_target_time:
-        is_reminder = True
-        target_time_str = extracted_target_time
-        is_asking_history = False
-        input_content = f"主人設定了一個絕對時間提醒：『{user_message}』（預定時間：{target_time_str}，內容：{reminder_content}）。\n請依據系統指令給予幽默吐槽，並在核心提煉中條列：1. 設定絕對時間提醒。 2. 預定時間：{target_time_str}。 3. 提醒內容：{reminder_content}。"
-    else:
-        # 如果沒抓到時間，交給 AI 判斷是歷史查詢還是普通記錄
-        parsing_prompt = f"""
-        現在台灣時間是: {current_time_str} (日期是: {current_date_str})
-        請分析主人說的一句話：『{user_message}』
-        請嚴格回傳一個合法的 JSON 格式（不要加上任何 markdown 標籤，直接回傳純文字 JSON）：
-        {{
-          "intent": "QUERY" 或 "WRITE"
-        }}
-        """
-        try:
-            parse_res = ai_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=parsing_prompt
-            )
-            raw_res = parse_res.text.strip()
-            clean_text = re.sub(r'^```(?:json)?\s*([\s\S]*?)\s*```$', r'\1', raw_res)
-            parsed_data = json.loads(clean_text)
-            is_asking_history = (parsed_data.get("intent") == "QUERY")
-        except Exception:
-            is_asking_history = False
-            
-        is_reminder = False
-        target_time_str = ""
+    # 2. 讓 AI 判斷使用者的真實意圖 (QUERY, WRITE, REMINDER)
+    parsing_prompt = f"""
+    現在台灣時間是: {current_time_str} (日期是: {current_date_str})
+    請分析主人說的一句話：『{user_message}』
+    
+    請判斷主人的意圖，並嚴格回傳一個合法的 JSON 格式（不要加上任何 markdown 標籤，直接回傳純文字 JSON）：
+    {{
+      "intent": "QUERY" (查詢歷史), 或 "REMINDER" (要求設定鬧鐘/定時提醒), 或 "WRITE" (普通聊天/記事/碎碎念),
+      "target_time": "{extracted_target_time if extracted_target_time else 'YYYY-MM-DD HH:MM:SS'}",
+      "reminder_content": "要提醒的具體事情內容"
+    }}
+    """
+    
+    try:
+        parse_res = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=parsing_prompt
+        )
+        raw_res = parse_res.text.strip()
+        clean_text = re.sub(r'^```(?:json)?\s*([\s\S]*?)\s*```$', r'\1', raw_res)
+        parsed_data = json.loads(clean_text)
+    except Exception as e:
+        logging.error(f"意圖解析失敗: {e}")
+        parsed_data = {"intent": "WRITE"}
+
+    intent = parsed_data.get("intent", "WRITE")
+    is_asking_history = (intent == "QUERY")
+    is_reminder = (intent == "REMINDER")
+    
+    target_time_str = parsed_data.get("target_time", extracted_target_time)
+    reminder_content = parsed_data.get("reminder_content", user_message)
 
     # 3. 處理 AI 回覆內容生成
     try:
         if is_asking_history:
             input_content = f"主人正在查詢歷史，提問如下：\n『{user_message}』\n\n【以下是為您調出的歷史黑盒子檔案】:\n{history_context}\n\n請根據檔案內容，精確回答主人的問題。"
-        elif not is_reminder:
+        elif is_reminder:
+            input_content = f"主人設定了一個絕對時間提醒：『{user_message}』（預定時間：{target_time_str}，內容：{reminder_content}）。\n請依據系統指令給予幽默吐槽，並在核心提煉中條列：1. 設定絕對時間提醒。 2. 預定時間：{target_time_str}。 3. 提醒內容：{reminder_content}。"
+        else:
             input_content = f"主人正在記錄新日常：\n『{user_message}』\n\n請依據系統指令進行排毒與提煉。"
             
         response = ai_client.models.generate_content(
@@ -149,7 +144,7 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         ai_reply = f"❌ AI 腦袋卡住：({str(e)})"
 
-    # 4. 如果是提醒，寫入 Supabase 的 reminders 資料表
+    # 4. 如果是明確的提醒，寫入 Supabase 的 reminders 資料表供定時推播
     if is_reminder and target_time_str:
         try:
             url = f"{SUPABASE_URL}/rest/v1/reminders"
@@ -167,7 +162,7 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"存入 Supabase 提醒例外: {e}")
 
-    # 5. 寫入 Supabase 歷史聊天資料庫
+    # 5. 將對話寫入 Supabase 歷史聊天資料庫 (brain_box)
     if not is_asking_history and user_message:
         try:
             url = f"{SUPABASE_URL}/rest/v1/brain_box"
@@ -183,3 +178,98 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"寫入 Supabase 失敗: {e}")
 
     await update.message.reply_text(ai_reply)
+
+# 支援 /check 路由的 HTTP 伺服器
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed_path = urllib.parse.urlparse(self.path)
+        if parsed_path.path == "/check":
+            triggered_count = check_and_send_reminders()
+            response_text = f"Checked reminders. Triggered: {triggered_count}".encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(response_text)))
+            self.end_headers()
+            self.wfile.write(response_text)
+        else:
+            response_text = b"Bot is running!"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(response_text)))
+            self.end_headers()
+            self.wfile.write(response_text)
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+def check_and_send_reminders() -> int:
+    """檢查 Supabase 中時間已到且未發送的提醒"""
+    try:
+        now_taipei = datetime.now(TAIPEI_TZ)
+        now_str = now_taipei.strftime("%Y-%m-%d %H:%M:%S")
+        
+        url = f"{SUPABASE_URL}/rest/v1/reminders?is_sent=eq.false&target_time=lte.{now_str}&select=*"
+        res = requests.get(url, headers=SUPABASE_HEADERS)
+        if res.status_code != 200:
+            return 0
+            
+        reminders = res.json()
+        count = 0
+        for rem in reminders:
+            rem_id = rem.get("id")
+            chat_id = rem.get("chat_id")
+            content = rem.get("content")
+            
+            tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": f"🔔【大腦快取主動提醒】：{content}"
+            }
+            tg_res = requests.post(tg_url, json=payload, timeout=10)
+            if tg_res.status_code == 200:
+                update_url = f"{SUPABASE_URL}/rest/v1/reminders?id=eq.{rem_id}"
+                requests.patch(update_url, headers=SUPABASE_HEADERS, json={"is_sent": True})
+                count += 1
+                logging.info(f"成功透過 /check 觸發推播給 {chat_id}: {content}")
+            else:
+                logging.error(f"推播失敗: {tg_res.text}")
+        return count
+    except Exception as e:
+        logging.error(f"檢查提醒例外錯誤: {e}")
+        return 0
+
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
+    server.serve_forever()
+
+def main():
+    global SUPABASE_HEADERS
+    if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY or not SUPABASE_URL or not SUPABASE_KEY:
+        logging.error("環境變數缺失，請檢查設定！")
+        return
+    
+    SUPABASE_HEADERS = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
+    
+    server_thread = threading.Thread(target=run_dummy_server, daemon=True)
+    server_thread.start()
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_inbox))
+    
+    logging.info("Telegram Bot 雲端 Supabase 提醒架構啟動中...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
