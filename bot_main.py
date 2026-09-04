@@ -72,7 +72,7 @@ def read_supabase_history() -> str:
         return f"[無法從雲端讀取歷史紀錄: {str(e)}]"
 
 def fetch_web_page_content(url: str) -> str:
-    """自動抓取網頁文字內容（純內建/requests處理，不依賴外部套件）"""
+    """自動抓取網頁文字內容"""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -82,7 +82,6 @@ def fetch_web_page_content(url: str) -> str:
             return f"[無法讀取網頁，HTTP 狀態碼: {response.status_code}]"
         
         html_text = response.text
-        # 用正則表達式簡單去除 HTML 標籤抓取文字
         clean_text = re.sub(r'<script.*?>.*?</script>', '', html_text, flags=re.DOTALL)
         clean_text = re.sub(r'<style.*?>.*?</style>', '', clean_text, flags=re.DOTALL)
         clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
@@ -162,4 +161,5 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 contents=parsing_prompt
             )
             raw_res = parse_res.text.strip()
-            clean_text = re.sub(r'^```(?:json)?\s*([\s\S]*?)\s*
+            # 簡單移除 markdown 區塊
+            clean_text = raw_res.replace("```json", "").replace("
