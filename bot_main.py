@@ -13,7 +13,6 @@ import urllib.parse
 import json
 import re
 import traceback
-from bs4 import BeautifulSoup
 
 # 載入環境變數
 load_dotenv()
@@ -73,7 +72,7 @@ def read_supabase_history() -> str:
         return f"[無法從雲端讀取歷史紀錄: {str(e)}]"
 
 def fetch_web_page_content(url: str) -> str:
-    """自動抓取網頁文字內容"""
+    """自動抓取網頁文字內容（純內建/requests處理，不依賴外部套件）"""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -82,17 +81,16 @@ def fetch_web_page_content(url: str) -> str:
         if response.status_code != 200:
             return f"[無法讀取網頁，HTTP 狀態碼: {response.status_code}]"
         
-        soup = BeautifulSoup(response.text, 'html.parser')
+        html_text = response.text
+        # 用正則表達式簡單去除 HTML 標籤抓取文字
+        clean_text = re.sub(r'<script.*?>.*?</script>', '', html_text, flags=re.DOTALL)
+        clean_text = re.sub(r'<style.*?>.*?</style>', '', clean_text, flags=re.DOTALL)
+        clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
+        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
         
-        # 移除不需要的標籤
-        for script in soup(["script", "style", "nav", "footer", "header"]):
-            script.decompose()
-            
-        text = soup.get_text(separator=' ', strip=True)
-        # 限制最大字數避免過長
-        if len(text) > 4000:
-            text = text[:4000] + "...(內容過長已截斷)"
-        return text
+        if len(clean_text) > 4000:
+            clean_text = clean_text[:4000] + "...(內容過長已截斷)"
+        return clean_text
     except Exception as e:
         return f"[網頁抓取發生錯誤: {str(e)}]"
 
@@ -164,165 +162,4 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 contents=parsing_prompt
             )
             raw_res = parse_res.text.strip()
-            clean_text = re.sub(r'^```(?:json)?\s*([\s\S]*?)\s*```$', r'\1', raw_res)
-            parsed_data = json.loads(clean_text)
-            is_asking_history = (parsed_data.get("intent") == "QUERY")
-        except Exception:
-            is_asking_history = False
-            
-        is_reminder = False
-        target_time_str = ""
-
-    # 4. 處理 AI 回覆內容生成
-    try:
-        if is_asking_history:
-            input_content = f"主人正在查詢歷史，提問如下：\n『{user_message}』\n\n【以下是為您調出的歷史黑盒子檔案】:\n{history_context}\n\n請根據檔案內容，精確回答主人的問題。"
-        elif not is_reminder and not is_url_request:
-            input_content = f"主人正在記錄新日常：\n『{user_message}』\n\n請依據系統指令進行排毒與提煉。"
-            
-        response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=input_content,
-            config=types.GenerateContentConfig(system_instruction=get_system_instruction(), temperature=0.3)
-        )
-        ai_reply = response.text
-    except Exception as e:
-        ai_reply = f"❌ AI 腦袋卡住：({str(e)})"
-
-    # 5. 如果是提醒，寫入 Supabase 的 reminders 資料表
-    if is_reminder and target_time_str:
-        try:
-            url = f"{SUPABASE_URL}/rest/v1/reminders"
-            payload = {
-                "chat_id": str(chat_id),
-                "target_time": target_time_str,
-                "content": reminder_content,
-                "is_sent": False
-            }
-            res = requests.post(url, headers=SUPABASE_HEADERS, json=payload)
-            if res.status_code in [200, 201]:
-                logging.info(f"成功將提醒存入 Supabase 雲端: {target_time_str} - {reminder_content}")
-            else:
-                logging.error(f"存入 Supabase 提醒失敗: {res.text}")
-        except Exception as e:
-            logging.error(f"存入 Supabase 提醒例外: {e}")
-
-    # 6. 寫入 Supabase 歷史聊天資料庫
-    if not is_asking_history and user_message:
-        try:
-            url = f"{SUPABASE_URL}/rest/v1/brain_box"
-            payload = {
-                "user_message": user_message,
-                "ai_reply": ai_reply,
-                "entry_type": "telegram_chat"
-            }
-            res = requests.post(url, headers=SUPABASE_HEADERS, json=payload)
-            if res.status_code not in [200, 201]:
-                logging.error(f"寫入 Supabase 失敗: {res.text}")
-        except Exception as e:
-            logging.error(f"寫入 Supabase 失敗: {e}")
-
-    await update.message.reply_text(ai_reply)
-
-# 支援 /check 路由的 HTTP 伺服器
-class SimpleHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        parsed_path = urllib.parse.urlparse(self.path)
-        if parsed_path.path == "/check":
-            triggered_count = check_and_send_reminders()
-            response_text = f"Checked reminders. Triggered: {triggered_count}".encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(response_text)))
-            self.end_headers()
-            self.wfile.write(response_text)
-        else:
-            response_text = b"Bot is running!"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(response_text)))
-            self.end_headers()
-            self.wfile.write(response_text)
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-
-    def log_message(self, format, *args):
-        return
-
-def check_and_send_reminders() -> int:
-    """檢查 Supabase 中時間已到且未發送的提醒"""
-    try:
-        now_taipei = datetime.now(TAIPEI_TZ)
-        now_str = now_taipei.strftime("%Y-%m-%d %H:%M:%S")
-        
-        url = f"{SUPABASE_URL}/rest/v1/reminders?is_sent=eq.false&target_time=lte.{now_str}&select=*"
-        res = requests.get(url, headers=SUPABASE_HEADERS)
-        if res.status_code != 200:
-            return 0
-            
-        reminders = res.json()
-        count = 0
-        for rem in reminders:
-            rem_id = rem.get("id")
-            chat_id = rem.get("chat_id")
-            content = rem.get("content")
-            
-            tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = {
-                "chat_id": chat_id,
-                "text": f"🔔【大腦快取主動提醒】：{content}"
-            }
-            tg_res = requests.post(tg_url, json=payload, timeout=10)
-            if tg_res.status_code == 200:
-                update_url = f"{SUPABASE_URL}/rest/v1/reminders?id=eq.{rem_id}"
-                requests.patch(update_url, headers=SUPABASE_HEADERS, json={"is_sent": True})
-                count += 1
-                logging.info(f"成功透過 /check 觸發推播給 {chat_id}: {content}")
-            else:
-                logging.error(f"推播失敗: {tg_res.text}")
-        return count
-    except Exception as e:
-        logging.error(f"檢查提醒例外錯誤: {e}")
-        return 0
-
-def run_dummy_server():
-    try:
-        port = int(os.environ.get("PORT", 10000))
-        server = HTTPServer(("0.0.0.0", port), SimpleHandler)
-        logging.info(f"HTTP 伺服器已在連接埠 {port} 啟動")
-        server.serve_forever()
-    except Exception as e:
-        logging.error(f"HTTP 伺服器啟動失敗: {e}")
-
-def main():
-    try:
-        global SUPABASE_HEADERS
-        if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY or not SUPABASE_URL or not SUPABASE_KEY:
-            logging.error("環境變數缺失，請檢查設定！")
-            return
-        
-        SUPABASE_HEADERS = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "return=minimal"
-        }
-        
-        server_thread = threading.Thread(target=run_dummy_server, daemon=True)
-        server_thread.start()
-
-        app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_inbox))
-        
-        logging.info("Telegram Bot 雲端 Supabase 提醒與網頁爬蟲架構啟動中...")
-        app.run_polling()
-    except Exception as e:
-        logging.error(f"主程式啟動發生重大例外: {e}")
-        traceback.print_exc()
-
-if __name__ == "__main__":
-    main()
+            clean_text = re.sub(r'^```(?:json)?\s*([\s\S]*?)\s*
