@@ -9,10 +9,10 @@ from google.genai import types
 import requests
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.parse
 import pytz
 import json
 import re
-import asyncio
 
 # 載入環境變數
 load_dotenv()
@@ -32,9 +32,6 @@ SUPABASE_HEADERS = {}
 
 # 強制設定台灣時區
 TAIPEI_TZ = pytz.timezone('Asia/Taipei')
-
-# 全域提醒清單
-ACTIVE_REMINDERS = []
 
 def get_system_instruction():
     """動態生成包含當前正確時間的系統指令"""
@@ -75,32 +72,7 @@ def read_supabase_history() -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：Asyncio 每秒監控提醒架構已上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
-
-async def global_reminder_checker(application: Application):
-    """每秒掃描全域提醒清單的背景任務"""
-    while True:
-        await asyncio.sleep(1)
-        now = datetime.now(TAIPEI_TZ)
-        to_remove = []
-        for r in ACTIVE_REMINDERS:
-            if now >= r["run_date"]:
-                try:
-                    await application.bot.send_message(
-                        chat_id=r["chat_id"],
-                        text=f"🔔【大腦快取主動提醒】：{r['content']}"
-                    )
-                    logging.info(f"成功主動推播給 {r['chat_id']}: {r['content']}")
-                except Exception as e:
-                    logging.error(f"主動推播失敗: {e}")
-                to_remove.append(r)
-        for r in to_remove:
-            ACTIVE_REMINDERS.remove(r)
-
-async def post_init(application: Application):
-    """機器人啟動時自動註冊背景監控任務"""
-    asyncio.create_task(global_reminder_checker(application))
-    logging.info("Asyncio 每秒提醒監控任務已成功掛載！")
+    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子：Supabase 雲端排程架構已上線！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
 
 async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
@@ -165,28 +137,29 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         ai_reply = f"❌ AI 腦袋卡住：({str(e)})"
 
-    # 3. 如果是絕對時間提醒，加入全域提醒清單
+    # 3. 如果是絕對時間提醒，直接寫入 Supabase 的 reminders 資料表（或 brain_box）
     if is_reminder:
         reminder_content = parsed_data.get("reminder_content", user_message)
         target_time_str = parsed_data.get("target_time", "")
 
-        run_date = None
         if target_time_str:
             try:
-                naive_dt = datetime.strptime(target_time_str, "%Y-%m-%d %H:%M:%S")
-                run_date = TAIPEI_TZ.localize(naive_dt)
-            except Exception as ex:
-                logging.error(f"時間轉換錯誤: {ex}")
+                url = f"{SUPABASE_URL}/rest/v1/reminders"
+                payload = {
+                    "chat_id": str(chat_id),
+                    "target_time": target_time_str,
+                    "content": reminder_content,
+                    "is_sent": False
+                }
+                res = requests.post(url, headers=SUPABASE_HEADERS, json=payload)
+                if res.status_code in [200, 201]:
+                    logging.info(f"成功將提醒存入 Supabase 雲端: {target_time_str} - {reminder_content}")
+                else:
+                    logging.error(f"存入 Supabase 提醒失敗: {res.text}")
+            except Exception as e:
+                logging.error(f"存入 Supabase 提醒例外: {e}")
 
-        if run_date and run_date > now_taipei:
-            ACTIVE_REMINDERS.append({
-                "chat_id": chat_id,
-                "run_date": run_date,
-                "content": reminder_content
-            })
-            logging.info(f"成功註冊提醒到全域清單，預定觸發時間 (台灣時間): {run_date}，內容: {reminder_content}")
-
-    # 4. 寫入 Supabase 雲端資料庫
+    # 4. 寫入 Supabase 歷史聊天資料庫
     if not is_asking_history and user_message:
         try:
             url = f"{SUPABASE_URL}/rest/v1/brain_box"
@@ -203,15 +176,26 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(ai_reply)
 
-# 保持 Render 服務在線的 HTTP 伺服器
+# 支援 /check 路由的 HTTP 伺服器（用來接收外部定時 Ping 並執行提醒檢查）
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        response_text = b"Bot is running!"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(response_text)))
-        self.end_headers()
-        self.wfile.write(response_text)
+        parsed_path = urllib.parse.urlparse(self.path)
+        if parsed_path.path == "/check":
+            # 觸發雲端提醒檢查
+            triggered_count = check_and_send_reminders()
+            response_text = f"Checked reminders. Triggered: {triggered_count}".encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(response_text)))
+            self.end_headers()
+            self.wfile.write(response_text)
+        else:
+            response_text = b"Bot is running!"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(response_text)))
+            self.end_headers()
+            self.wfile.write(response_text)
 
     def do_HEAD(self):
         self.send_response(200)
@@ -220,6 +204,45 @@ class SimpleHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         return
+
+def check_and_send_reminders() -> int:
+    """檢查 Supabase 中時間已到且未發送的提醒"""
+    try:
+        now_taipei = datetime.now(TAIPEI_TZ)
+        now_str = now_taipei.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 查詢未發送且目標時間小於等於現在的提醒
+        url = f"{SUPABASE_URL}/rest/v1/reminders?is_sent=eq.false&target_time=lte.{now_str}&select=*"
+        res = requests.get(url, headers=SUPABASE_HEADERS)
+        if res.status_code != 200:
+            return 0
+            
+        reminders = res.json()
+        count = 0
+        for rem in reminders:
+            rem_id = rem.get("id")
+            chat_id = rem.get("chat_id")
+            content = rem.get("content")
+            
+            # 透過 Telegram API 發送訊息
+            tg_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": f"🔔【大腦快取主動提醒】：{content}"
+            }
+            tg_res = requests.post(tg_url, json=payload, timeout=10)
+            if tg_res.status_code == 200:
+                # 標記為已發送
+                update_url = f"{SUPABASE_URL}/rest/v1/reminders?id=eq.{rem_id}"
+                requests.patch(update_url, headers=SUPABASE_HEADERS, json={"is_sent": True})
+                count += 1
+                logging.info(f"成功透過 /check 觸發推播給 {chat_id}: {content}")
+            else:
+                logging.error(f"推播失敗: {tg_res.text}")
+        return count
+    except Exception as e:
+        logging.error(f"檢查提醒例外錯誤: {e}")
+        return 0
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
@@ -242,12 +265,11 @@ def main():
     server_thread = threading.Thread(target=run_dummy_server, daemon=True)
     server_thread.start()
 
-    # 使用 post_init 掛載非同步每秒監控任務
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_inbox))
     
-    logging.info("Telegram Bot Asyncio 每秒監控架構啟動中...")
+    logging.info("Telegram Bot 雲端 Supabase 提醒架構啟動中...")
     app.run_polling()
 
 if __name__ == "__main__":
