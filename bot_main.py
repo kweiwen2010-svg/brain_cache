@@ -70,7 +70,7 @@ def read_supabase_history() -> str:
             
         return history_str
     except Exception as e:
-        return f"[無法從雲端讀取歷史紀錄: {str(e)]"
+        return f"[無法從雲端讀取歷史紀錄: {str(e)}]"
 
 def fetch_web_page_content(url: str) -> str:
     """自動抓取網頁文字內容"""
