@@ -73,47 +73,37 @@ def read_supabase_history() -> str:
         return f"[無法從雲端讀取歷史紀錄: {str(e)}]"
 
 def fetch_web_page_content(url: str) -> str:
-    """強健的網頁文字內容爬蟲（含重試與模擬瀏覽器偽裝）"""
+    """高強健性網頁爬蟲（縮短 timeout 至 5 秒，防範重度反爬蟲導致卡死）"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
     }
     
-    # 進行最多 2 次的重試機制，避免短暫網路波動失敗
-    for attempt in range(2):
-        try:
-            response = requests.get(url, headers=headers, timeout=8)
-            if response.status_code == 429:
-                logging.warning(f"爬取網頁遇到 HTTP 429 (Too Many Requests): {url}")
-                return "[系統提示：該網站目前流量過大或暫時限制訪問（HTTP 429），將為您根據標題與上下文進行智慧摘要。]"
-            
-            if response.status_code != 200:
-                if attempt == 1:
-                    return f"[無法讀取網頁，HTTP 狀態碼: {response.status_code}]"
-                time.sleep(1)
-                continue
-            
-            html_text = response.text
-            clean_text = re.sub(r'<script.*?>.*?</script>', '', html_text, flags=re.DOTALL)
-            clean_text = re.sub(r'<style.*?>.*?</style>', '', html_text, flags=re.DOTALL)
-            clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
-            clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-            
-            if len(clean_text) > 4000:
-                clean_text = clean_text[:4000] + "...(內容過長已截斷)"
-            return clean_text
-            
-        except Exception as e:
-            if attempt == 1:
-                logging.error(f"網頁抓取發生例外錯誤: {str(e)}")
-                return f"[網頁抓取發生錯誤，將自動轉為標題智慧摘要模式。]"
-            time.sleep(1)
-            
-    return "[網頁無法正常存取]"
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code == 429:
+            return "[系統提示：該網站流量過大或暫時限制訪問（HTTP 429），將為您根據標題進行智慧摘要。]"
+        
+        if response.status_code != 200:
+            return f"[無法讀取網頁，HTTP 狀態碼: {response.status_code}]"
+        
+        html_text = response.text
+        clean_text = re.sub(r'<script.*?>.*?</script>', '', html_text, flags=re.DOTALL)
+        clean_text = re.sub(r'<style.*?>.*?</style>', '', html_text, flags=re.DOTALL)
+        clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
+        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+        
+        if len(clean_text) > 4000:
+            clean_text = clean_text[:4000] + "...(內容過長已截斷)"
+        return clean_text
+        
+    except Exception as e:
+        logging.warning(f"網頁抓取逾時或失敗 ({str(e)})，安全降級為標題摘要模式。")
+        return "[網頁受防火牆防護或連線逾時，將自動轉為標題與常識智慧摘要模式。]"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子升級版：支援強健爬蟲與智慧降級防護！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
+    await update.message.reply_text(f"🤖 雲端大腦快取黑盒子升級版：支援極速回應與防護爬蟲！\n（你的 Chat ID: `{chat_id}`）", parse_mode="Markdown")
 
 async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
@@ -121,6 +111,7 @@ async def handle_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_message:
         return
 
+    # 立即發送「正在輸入」狀態，確保 Telegram 連線暢通並給予視覺回饋
     await update.message.reply_chat_action(action="typing")
     history_context = read_supabase_history()
     
@@ -277,7 +268,6 @@ def check_and_send_reminders() -> int:
         now_taipei = datetime.now(TAIPEI_TZ)
         now_str = now_taipei.strftime("%Y-%m-%d %H:%M:%S")
         
-        # 只撈取未發送且時間已到的提醒
         url = f"{SUPABASE_URL}/rest/v1/reminders?is_sent=eq.false&target_time=lte.{now_str}&select=*"
         res = requests.get(url, headers=SUPABASE_HEADERS)
         if res.status_code != 200:
@@ -290,13 +280,12 @@ def check_and_send_reminders() -> int:
             chat_id = rem.get("chat_id")
             content = rem.get("content")
             
-            # 【關鍵優化】：先將該筆資料在資料庫標記為 is_sent=true，形成防重複鎖（Idempotency Lock）
-            # 這樣即使背景檢查執行緒短時間內重複執行，也不會造成同一則提醒被連續發送兩次
+            # 防重複發送鎖（Idempotency Lock）
             update_url = f"{SUPABASE_URL}/rest/v1/reminders?id=eq.{rem_id}"
             lock_res = requests.patch(update_url, headers=SUPABASE_HEADERS, json={"is_sent": True})
             
             if lock_res.status_code not in [200, 204]:
-                continue # 如果鎖定失敗，跳過避免重複發送
+                continue
             
             tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             payload = {
@@ -310,7 +299,7 @@ def check_and_send_reminders() -> int:
                 count += 1
                 logging.info(f"成功透過 /check 觸發強效推播給 {chat_id}: {content}")
             else:
-                logging.error(f"推播失敗，雖然已鎖定狀態: {tg_res.text}")
+                logging.error(f"推播失敗: {tg_res.text}")
         return count
     except Exception as e:
         logging.error(f"檢查提醒例外錯誤: {e}")
@@ -346,7 +335,7 @@ def main():
         app.add_handler(CommandHandler("start", start))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_inbox))
         
-        logging.info("Telegram Bot 雲端 Supabase 提醒與智慧爬蟲防護架構啟動中...")
+        logging.info("Telegram Bot 雲端 Supabase 提醒與智慧降級架構啟動中...")
         app.run_polling()
     except Exception as e:
         logging.error(f"主程式啟動發生重大例外: {e}")
